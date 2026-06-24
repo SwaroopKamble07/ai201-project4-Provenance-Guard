@@ -101,6 +101,22 @@ A piece of text submitted via `POST /submit` is given a unique `content_id` and 
 
 **Output format.** A single float in `[0.0, 1.0]` where `0.0` = confidently human-written and `1.0` = confidently AI-generated. Parsed from a constrained JSON response from the model.
 
+**Exact prompt (used at call time).**
+```
+You are an AI-vs-human writing classifier. Read the text and return
+ONLY a JSON object of the form {"ai_probability": <float between 0 and 1>}
+with no commentary, where 0.0 means certainly human-written and 1.0
+means certainly AI-generated. Consider hedging phrases, generic
+structure, uniform register, and whether the text looks like a polished
+LLM draft.
+
+Text:
+"""
+{text}
+"""
+```
+The function will parse the model's JSON, clamp the float to `[0, 1]`, and return it. If parsing fails, the function returns `0.5` (the maximum-uncertainty value) so the rest of the pipeline degrades gracefully without crashing.
+
 **Why this property differs.** LLMs are trained to produce predictable, low-perplexity continuations; they overuse certain transitional phrases and avoid the idiosyncratic quirks (typos, abrupt topic shifts, dialect, dead metaphors) that humans leave behind.
 
 **Blind spots.**
@@ -110,12 +126,18 @@ A piece of text submitted via `POST /submit` is given a unique `content_id` and 
 
 ### Signal 2 — Stylometric heuristics (structural)
 
-**Property measured.** Three computable statistics computed in pure Python:
-1. **Sentence length variance** — standard deviation of sentence lengths. AI text tends toward uniform sentence length; human writing has a long tail of very short or very long sentences.
-2. **Type-token ratio (TTR)** — unique words / total words. AI text tends toward lower vocabulary diversity (it leans on a smaller "safe" vocabulary).
-3. **Punctuation density** — punctuation marks per 100 words. Humans use more em-dashes, semicolons, and abrupt commas; AI is more conservative.
+**Properties measured.** Three computable statistics computed in pure Python:
 
-These three are normalized to `[0, 1]` per-metric and averaged into a single structural score.
+1. **Sentence length variance (slv).** Standard deviation of the length (in words) of each sentence in the text. To normalize to `[0, 1]`, divide by a reference value of `12.0` and clamp: `slv_score = clamp(slv / 12.0, 0, 1)`. Higher variance → lower AI-likelihood → smaller score.
+
+2. **Type-token ratio (ttr).** `unique_words / total_words`, computed case-insensitively after stripping punctuation. Reference for "AI-like" vocabulary diversity: around `0.45`. We invert so that low TTR (more repetitive) scores closer to 1: `ttr_score = clamp(1.0 - (ttr - 0.30) / 0.30, 0, 1)`. Practically: TTR of `0.30` or below → `1.0` (max AI-likelihood); TTR of `0.60` or above → `0.0`.
+
+3. **Punctuation density (pd).** Punctuation marks (`. , ; : ! ? - —`) per 100 words. AI text sits around `4` per 100 words; human text around `7` per 100 words. `pd_score = clamp(1.0 - (pd - 3.0) / 5.0, 0, 1)`.
+
+These three are averaged uniformly into a single structural score:
+`struct_score = (slv_score + ttr_score + pd_score) / 3.0`.
+
+**Edge handling.** If the text has fewer than 3 sentences or fewer than 30 total words, the heuristics return `0.5` (no opinion) — short text is unreliable for structural statistics, and an uncertain value is safer than a guessed one.
 
 **Output format.** A single float in `[0.0, 1.0]` (same scale as Signal 1).
 
@@ -145,16 +167,28 @@ These thresholds are not symmetric around 0.5. The "Likely AI" band starts at 0.
 
 ### Combining the two signals
 
-```
-combined_raw = w_llm * llm_score + w_struct * struct_score
-              + interpolation_term_when_signals_disagree
+```python
+def combine(llm_score: float, struct_score: float) -> dict:
+    # weights from spec: LLM judge gets more weight than heuristics
+    raw = 0.6 * llm_score + 0.4 * struct_score
+
+    # disagreement penalty: when signals fight, lean toward uncertainty
+    if abs(llm_score - struct_score) > 0.3:
+        raw = raw * 0.85 + 0.5 * 0.15   # pull 15% toward 0.5
+
+    confidence = max(0.0, min(1.0, raw))
+
+    if confidence > 0.70:
+        attribution = "likely_ai"
+    elif confidence < 0.30:
+        attribution = "likely_human"
+    else:
+        attribution = "uncertain"
+
+    return {"confidence": confidence, "attribution": attribution}
 ```
 
 Weights: `w_llm = 0.6`, `w_struct = 0.4`. The LLM judge is given more weight because semantic evidence carries more information than three structural metrics, but the structural signal is not negligible — it can catch cases the LLM misses (edited AI drafts) and can contradict the LLM when the LLM is biased (non-native English).
-
-Disagreement penalty: if `|llm_score - struct_score| > 0.3`, nudge `combined_raw` toward `0.5` by 0.05 (the system should flag uncertainty rather than pick a side when the signals fight).
-
-Result is then passed through the asymmetric thresholds above to assign the label.
 
 ---
 
@@ -180,7 +214,18 @@ Three variants. Each one is the literal text shown to a reader on the platform, 
 **Body:**
 > The two analysis signals used by Provenance Guard disagree on this submission, or both are weak. We cannot make a confident attribution in either direction. Readers should treat the authorship of this piece as unverified.
 
-These three texts must change with the score — they are not the same string regardless of band.
+These three texts must change with the score — they are not the same string regardless of band. The full label object — both the `headline` and `body` strings — is what the API returns in the `label` field of the `/submit` response (see the API surface section below for the exact response shape).
+
+**Selection logic (used by M5):**
+```python
+if confidence > 0.70:
+    return LABELS["likely_ai"]
+elif confidence < 0.30:
+    return LABELS["likely_human"]
+else:
+    return LABELS["uncertain"]
+```
+The category assigned here uses the *same* thresholds as `combine()` so a content record's `attribution` field matches its `label` variant.
 
 ---
 
@@ -213,9 +258,19 @@ The creator identified by the `creator_id` associated with the original `content
 
 No automated re-classification is performed. The decision waits for human review.
 
-### What a human reviewer sees
+### What a human reviewer sees in the appeal queue
 
-In the audit log, an appeal appears as a second entry with the same `content_id` as the original classification. The reviewer has access to: original text, both raw signal scores, the combined confidence, the chosen label, the appeal reasoning, and current status. They can then make a manual override.
+A simple view: `GET /log?status=under_review` returns all log entries whose current status is `under_review`. Each entry exposes:
+
+- `content_id` — links the appeal to the original submission.
+- Original `text` from the submission event.
+- `llm_score` and `stylometric_score` (raw, so the reviewer can see what the system saw).
+- `confidence` (the combined score).
+- `attribution` and `label` from the original decision.
+- `creator_reasoning` — the free-text appeal argument.
+- `appeal_timestamp` — when the appeal was filed.
+
+A real product would render these in a dashboard; for grading visibility we surface them through `/log` with an optional status filter. The minimum record fields are sufficient for a reviewer to make a manual override decision.
 
 ---
 
@@ -309,3 +364,24 @@ This section pre-specifies what spec sections will be fed to an AI assistant in 
 ### Rate limiting
 - `POST /submit`: 10 per minute, 100 per day per IP address.
 - Rationale: a creator submitting their own work would realistically submit a handful of pieces per day, never ten per minute. The per-minute limit blocks naive flood scripts; the daily limit blocks slower sustained abuse. Limits chosen specifically to be defensible, not arbitrary.
+
+---
+
+## Stretch features (planned)
+
+To be re-scoped and updated **before** starting any stretch work, per the Milestone 5 instruction.
+
+- *Ensemble detection (3+ signals)* — possible candidates: perplexity proxy via token-frequency rarity, repetition-of-phrase counter, n-gram repetition of function-word trigrams. Not started.
+- *Provenance certificate ("verified human" credential)* — design idea: an additional verification step (e.g., a timed writing sample prompt) the creator completes, after which their `creator_id` is flagged `verified_human = true` and downstream labels downgrade AI-likelihood for that creator's content. Not started.
+- *Analytics dashboard* — minimum entries: aggregate detection patterns by attribution band, appeal rate, false-positive rate derived from appeal outcomes. Plus one additional metric TBD before implementation.
+- *Multi-modal support* — second content type: image descriptions using EXIF metadata plus OCR (stub library such as `pytesseract`). Not started.
+
+## Spec sign-off (Milestone 2)
+
+- All five required questions answered with specific, implementation-ready answers above.
+- Three transparency label variants written out verbatim and mapped to thresholds.
+- Confidence scoring produces three different labels at different score ranges (not a binary flip at 0.5); thresholds are asymmetric (0.30 / 0.70) per the false-positive asymmetry.
+- `## Architecture` section contains the diagram and the 2–3-sentence flow narrative.
+- `## AI Tool Plan` covers Milestones 3, 4, and 5 with specific spec sections provided to the AI tool, what is asked for, and verification steps.
+
+No code has been written yet; implementation in Milestones 3–5 will be driven from this document.
